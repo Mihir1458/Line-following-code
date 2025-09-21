@@ -1,0 +1,312 @@
+
+# Line Following Robot with PID Control
+# MicroPython Code for Raspberry Pi Pico
+# Compatible with Thonny IDE
+
+from machine import Pin, PWM
+from utime import sleep, ticks_ms, ticks_diff
+import gc
+
+# Pin Definitions Based on Your Connections
+# IR Sensors (5 Array)
+IR_LEFT = Pin(2, Pin.IN)    # GP2 -> IR1 (Leftmost)
+IR2 = Pin(3, Pin.IN)        # GP3 -> IR2
+IR3 = Pin(4, Pin.IN)        # GP4 -> IR3
+IR4 = Pin(5, Pin.IN)        # GP5 -> IR4
+IR_RIGHT = Pin(6, Pin.IN)   # GP6 -> IR5 (Rightmost)
+
+# Motor Driver TB6612FNG Pins
+MOTOR_STBY = Pin(22, Pin.OUT)  # Connected to 3V3 via your connection
+MOTOR_AIN1 = Pin(10, Pin.OUT)  # GP10 -> AIN1
+MOTOR_AIN2 = Pin(11, Pin.OUT)  # GP11 -> AIN2
+MOTOR_PWMA = PWM(Pin(12))      # GP12 -> PWMA (Left Motor)
+MOTOR_BIN1 = Pin(13, Pin.OUT)  # GP13 -> BIN1
+MOTOR_BIN2 = Pin(14, Pin.OUT)  # GP14 -> BIN2
+MOTOR_PWMB = PWM(Pin(15))      # GP15 -> PWMB (Right Motor)
+
+# PWM Settings
+MOTOR_PWMA.freq(1000)
+MOTOR_PWMB.freq(1000)
+
+# Enable motor driver
+MOTOR_STBY.value(1)
+
+# PID Constants (Tunable)
+KP = 30.0    # Proportional gain
+KI = 0.0     # Integral gain (start with 0)
+KD = 15.0    # Derivative gain
+
+# Motor Settings
+BASE_SPEED = 25000  # Base PWM value (0-65535)
+MAX_SPEED = 40000   # Maximum PWM value
+MIN_SPEED = 5000    # Minimum PWM value
+
+# Global Variables
+previous_error = 0
+integral = 0
+last_time = 0
+
+# Sensor reading function
+def read_sensors():
+    """Read all IR sensors and return their values as a list"""
+    sensors = [
+        IR_LEFT.value(),
+        IR2.value(),
+        IR3.value(),
+        IR4.value(),
+        IR_RIGHT.value()
+    ]
+    return sensors
+
+def calculate_position():
+    """Calculate line position based on sensor readings"""
+    sensors = read_sensors()
+    
+    # Position weights for 5 sensors (0 = far left, 4000 = far right, 2000 = center)
+    weights = [0, 1000, 2000, 3000, 4000]
+    
+    weighted_sum = 0
+    sum_values = 0
+    
+    for i, sensor in enumerate(sensors):
+        if sensor == 1:  # Line detected (assuming 1 = line, 0 = no line)
+            weighted_sum += weights[i] * sensor
+            sum_values += sensor
+    
+    if sum_values == 0:
+        # No line detected, return center position
+        return 2000
+    
+    position = weighted_sum // sum_values
+    return position
+
+def motor_control(left_speed, right_speed):
+    """Control both motors with speed values"""
+    
+    # Constrain speeds
+    left_speed = max(MIN_SPEED, min(MAX_SPEED, abs(left_speed)))
+    right_speed = max(MIN_SPEED, min(MAX_SPEED, abs(right_speed)))
+    
+    # Left Motor (Motor A)
+    if left_speed >= 0:
+        MOTOR_AIN1.value(1)
+        MOTOR_AIN2.value(0)
+    else:
+        MOTOR_AIN1.value(0)
+        MOTOR_AIN2.value(1)
+    
+    # Right Motor (Motor B)
+    if right_speed >= 0:
+        MOTOR_BIN1.value(1)
+        MOTOR_BIN2.value(0)
+    else:
+        MOTOR_BIN1.value(0)
+        MOTOR_BIN2.value(1)
+    
+    # Set PWM duty cycles
+    MOTOR_PWMA.duty_u16(int(left_speed))
+    MOTOR_PWMB.duty_u16(int(right_speed))
+
+def stop_motors():
+    """Stop both motors"""
+    MOTOR_AIN1.value(0)
+    MOTOR_AIN2.value(0)
+    MOTOR_BIN1.value(0)
+    MOTOR_BIN2.value(0)
+    MOTOR_PWMA.duty_u16(0)
+    MOTOR_PWMB.duty_u16(0)
+
+def pid_control():
+    """Calculate PID control output"""
+    global previous_error, integral, last_time
+    
+    current_time = ticks_ms()
+    
+    # Calculate position error (setpoint = 2000 for center)
+    position = calculate_position()
+    error = 2000 - position
+    
+    # Time difference
+    if last_time == 0:
+        dt = 20  # First iteration, assume 20ms
+    else:
+        dt = ticks_diff(current_time, last_time)
+        if dt == 0:
+            dt = 1  # Avoid division by zero
+    
+    last_time = current_time
+    
+    # PID calculations
+    proportional = error
+    integral += error * dt
+    derivative = (error - previous_error) / dt if dt > 0 else 0
+    
+    # Anti-windup for integral term
+    if abs(integral) > 1000:
+        integral = 1000 if integral > 0 else -1000
+    
+    # Calculate PID output
+    pid_output = (KP * proportional) + (KI * integral) + (KD * derivative)
+    
+    previous_error = error
+    
+    return pid_output, error, position
+
+def line_following():
+    """Main line following function"""
+    print("Line Following Started!")
+    print("Press Ctrl+C to stop")
+    
+    try:
+        while True:
+            # Get PID output
+            pid_output, error, position = pid_control()
+            
+            # Calculate motor speeds
+            left_speed = BASE_SPEED - pid_output
+            right_speed = BASE_SPEED + pid_output
+            
+            # Apply motor control
+            motor_control(left_speed, right_speed)
+            
+            # Debug information (comment out for better performance)
+            sensors = read_sensors()
+            print(f"Sensors: {sensors}, Pos: {position}, Error: {error:.1f}, PID: {pid_output:.1f}")
+            
+            # Small delay
+            sleep(0.02)  # 50Hz update rate
+            
+            # Garbage collection to prevent memory issues
+            if ticks_ms() % 1000 < 50:  # Every ~1 second
+                gc.collect()
+                
+    except KeyboardInterrupt:
+        print("Stopping robot...")
+        stop_motors()
+        print("Robot stopped!")
+
+def calibrate_sensors():
+    """Calibrate sensors by reading them for a few seconds"""
+    print("Sensor Calibration")
+    print("Move the robot over different surfaces...")
+    
+    for i in range(100):  # 10 seconds of calibration
+        sensors = read_sensors()
+        position = calculate_position()
+        print(f"Sensors: {sensors}, Position: {position}")
+        sleep(0.1)
+    
+    print("Calibration complete!")
+
+def test_motors():
+    """Test motor functionality"""
+    print("Testing motors...")
+    
+    print("Moving forward...")
+    motor_control(20000, 20000)
+    sleep(2)
+    
+    print("Turning left...")
+    motor_control(10000, 25000)
+    sleep(1)
+    
+    print("Turning right...")
+    motor_control(25000, 10000)
+    sleep(1)
+    
+    print("Stopping...")
+    stop_motors()
+    sleep(1)
+    
+    print("Motor test complete!")
+
+def display_menu():
+    """Display main menu"""
+    print("\n" + "="*40)
+    print("LINE FOLLOWING ROBOT - MAIN MENU")
+    print("="*40)
+    print("1. Start Line Following")
+    print("2. Test Motors")
+    print("3. Calibrate Sensors")
+    print("4. Adjust PID Parameters")
+    print("5. Exit")
+    print("="*40)
+
+def adjust_pid():
+    """Interactive PID tuning"""
+    global KP, KI, KD
+    
+    while True:
+        print(f"\nCurrent PID values: KP={KP}, KI={KI}, KD={KD}")
+        print("1. Adjust KP (Proportional)")
+        print("2. Adjust KI (Integral)")  
+        print("3. Adjust KD (Derivative)")
+        print("4. Reset to defaults")
+        print("5. Back to main menu")
+        
+        try:
+            choice = input("Enter choice (1-5): ")
+            
+            if choice == '1':
+                KP = float(input(f"Enter new KP value (current: {KP}): "))
+            elif choice == '2':
+                KI = float(input(f"Enter new KI value (current: {KI}): "))
+            elif choice == '3':
+                KD = float(input(f"Enter new KD value (current: {KD}): "))
+            elif choice == '4':
+                KP, KI, KD = 30.0, 0.0, 15.0
+                print("PID values reset to defaults")
+            elif choice == '5':
+                break
+            else:
+                print("Invalid choice!")
+                
+        except ValueError:
+            print("Invalid input! Please enter a number.")
+        except KeyboardInterrupt:
+            break
+
+# Main program
+def main():
+    """Main program loop"""
+    print("Initializing Line Following Robot...")
+    
+    # Initialize motors to stopped state
+    stop_motors()
+    sleep(0.5)
+    
+    while True:
+        display_menu()
+        
+        try:
+            choice = input("Enter your choice (1-5): ")
+            
+            if choice == '1':
+                line_following()
+            elif choice == '2':
+                test_motors()
+            elif choice == '3':
+                calibrate_sensors()
+            elif choice == '4':
+                adjust_pid()
+            elif choice == '5':
+                print("Exiting program...")
+                stop_motors()
+                break
+            else:
+                print("Invalid choice! Please enter 1-5.")
+                
+        except KeyboardInterrupt:
+            print("\nProgram interrupted!")
+            stop_motors()
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            stop_motors()
+
+# Auto-start if this is the main file
+if __name__ == "__main__":
+    main()
+
+# Alternative: Uncomment the line below to start line following immediately
+# line_following()
